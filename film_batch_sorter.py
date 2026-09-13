@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
 Film Batch Sorter — local web app
-Installs flask + anthropic if needed, then opens http://localhost:5174
+Supports two vision backends:
+  • Ollama  (local, free, no internet — recommended)
+  • Anthropic Claude (cloud API, requires key + tokens)
 """
 
 import os, re, json, sys, shutil, base64, queue, threading, webbrowser, subprocess
+import urllib.request, urllib.error
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── auto-install ──────────────────────────────────────────────────────────────
 def _pip(*pkgs):
@@ -38,6 +42,9 @@ except ImportError:
     import rawpy
 
 SUPPORTED_EXT = {".jpg", ".jpeg", ".nef"}
+OLLAMA_URL    = "http://localhost:11434"
+PARALLEL_WORKERS_CLOUD = 6   # concurrent calls for Anthropic
+PARALLEL_WORKERS_LOCAL = 1   # Ollama processes one at a time on GPU
 
 # ── config ────────────────────────────────────────────────────────────────────
 CONFIG_PATH = Path.home() / ".film_batch_sorter.json"
@@ -73,6 +80,22 @@ def pick_folder():
     path = r.stdout.strip() if r.returncode == 0 else ""
     return jsonify({"path": path})
 
+@app.route("/check-ollama", methods=["GET"])
+def check_ollama():
+    """Check if Ollama is running and return available vision models."""
+    try:
+        req = urllib.request.Request(f"{OLLAMA_URL}/api/tags")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+        # Filter to known vision-capable models
+        vision_models = {"llava", "llava-phi3", "llava:13b", "llava:34b",
+                         "moondream", "bakllava", "minicpm-v", "llava-llama3"}
+        models = [m["name"] for m in data.get("models", [])
+                  if any(v in m["name"].lower() for v in vision_models)]
+        return jsonify({"running": True, "models": models})
+    except Exception:
+        return jsonify({"running": False, "models": []})
+
 @app.route("/scan", methods=["POST"])
 def scan():
     data = request.json or {}
@@ -100,16 +123,9 @@ def progress(jid):
                     content_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-PARALLEL_WORKERS = 6   # concurrent API calls
-
-def _nat_key(p: Path):
-    return [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", p.name)]
-
-def _vision_call(client: anthropic.Anthropic, path: Path) -> str:
-    """Return 3-digit string if a batch marker is found, otherwise 'NO'."""
+# ── image prep (shared) ───────────────────────────────────────────────────────
+def _load_rotations(path: Path) -> list[str]:
+    """Load image, resize, return list of base64 JPEG strings at 0° and 180°."""
     if path.suffix.lower() == ".nef":
         with rawpy.imread(str(path)) as raw:
             rgb = raw.postprocess()
@@ -122,26 +138,34 @@ def _vision_call(client: anthropic.Anthropic, path: Path) -> str:
     if max(img.size) > max_side:
         img.thumbnail((max_side, max_side), Image.LANCZOS)
 
-    content = []
+    b64_list = []
     for angle in (0, 180):
         rotated = img.rotate(angle, expand=True)
         buf = io.BytesIO()
         rotated.save(buf, format="JPEG", quality=82)
-        content.append({"type": "image", "source": {
-            "type": "base64", "media_type": "image/jpeg",
-            "data": base64.b64encode(buf.getvalue()).decode()
-        }})
-    content.append({"type": "text", "text": (
-        "I am sending you the same image at 0° and 180° rotation. "
-        "Look for a small rectangular label that contains a printed "
-        "(never handwritten) 3-digit number — it may look like a sticker, "
-        "paper tag, or printed strip. "
-        "One of the two rotations will show it the right way up. "
-        "Reply with ONLY the 3-digit number exactly as printed, e.g. \"042\". "
-        "If no such printed 3-digit label is visible in any rotation, "
-        "reply with only \"NO\"."
-    )})
+        b64_list.append(base64.b64encode(buf.getvalue()).decode())
+    return b64_list
 
+PROMPT = (
+    "I am sending you the same image at 0° and 180° rotation. "
+    "Look for a small rectangular label that contains a printed "
+    "(never handwritten) 3-digit number — it may look like a sticker, "
+    "paper tag, or printed strip. "
+    "One of the two rotations will show it the right way up. "
+    "Reply with ONLY the 3-digit number exactly as printed, e.g. \"042\". "
+    "If no such printed 3-digit label is visible in any rotation, "
+    "reply with only \"NO\"."
+)
+
+# ── Anthropic backend ─────────────────────────────────────────────────────────
+def _vision_call_anthropic(client: anthropic.Anthropic, path: Path) -> str:
+    b64_list = _load_rotations(path)
+    content = [
+        {"type": "image", "source": {"type": "base64",
+                                      "media_type": "image/jpeg", "data": b}}
+        for b in b64_list
+    ]
+    content.append({"type": "text", "text": PROMPT})
     resp = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=32,
@@ -149,51 +173,83 @@ def _vision_call(client: anthropic.Anthropic, path: Path) -> str:
     )
     return resp.content[0].text.strip()
 
+# ── Ollama backend ────────────────────────────────────────────────────────────
+def _vision_call_ollama(model: str, path: Path) -> str:
+    b64_list = _load_rotations(path)
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": PROMPT, "images": b64_list}],
+        "stream": False,
+        "options": {"temperature": 0}
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read())
+    return data["message"]["content"].strip()
+
+# ── scan worker ───────────────────────────────────────────────────────────────
+def _nat_key(p: Path):
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", p.name)]
+
 def _run_scan(data: dict, q: queue.Queue):
     def send(**kw): q.put(kw)
 
-    api_key   = data.get("api_key", "").strip()
-    inp_dir   = Path(data.get("input_dir", ""))
-    out_dir   = Path(data.get("output_dir", ""))
-    recursive = data.get("recursive", False)
+    backend      = data.get("backend", "anthropic")   # "anthropic" | "ollama"
+    api_key      = data.get("api_key", "").strip()
+    ollama_model = data.get("ollama_model", "llava-phi3").strip()
+    inp_dir      = Path(data.get("input_dir", ""))
+    out_dir      = Path(data.get("output_dir", ""))
+    recursive    = data.get("recursive", False)
 
-    if not api_key:
-        return send(tag="err", msg="No API key provided.", done=True)
+    # Validate
+    if backend == "anthropic" and not api_key:
+        return send(tag="err", msg="No Anthropic API key provided.", done=True)
     if not inp_dir.is_dir():
         return send(tag="err", msg=f"Input folder not found: {inp_dir}", done=True)
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Collect files
     if recursive:
-        jpgs = sorted(
+        files = sorted(
             {p for p in inp_dir.rglob("*") if p.suffix.lower() in SUPPORTED_EXT and p.is_file()},
             key=_nat_key
         )
     else:
-        jpgs = sorted(
+        files = sorted(
             [p for p in inp_dir.iterdir() if p.suffix.lower() in SUPPORTED_EXT and p.is_file()],
             key=_nat_key
         )
 
-    total = len(jpgs)
+    total = len(files)
     if not total:
         return send(tag="info", msg="No images found in the selected folder.", done=True)
 
-    send(tag="info", msg=f"Found {total} image(s) — scanning {PARALLEL_WORKERS} at a time…",
+    workers = PARALLEL_WORKERS_LOCAL if backend == "ollama" else PARALLEL_WORKERS_CLOUD
+    backend_label = f"Ollama ({ollama_model})" if backend == "ollama" else "Anthropic Claude"
+    send(tag="info",
+         msg=f"Found {total} image(s) — scanning with {backend_label}, {workers} at a time…",
          total=total, progress=0)
 
-    client = anthropic.Anthropic(api_key=api_key)
+    # Set up backend client
+    client = anthropic.Anthropic(api_key=api_key) if backend == "anthropic" else None
 
     # ── Phase 1: parallel vision scan ─────────────────────────────────────────
-    # answers[i] = ("OK", answer_str) | ("ERR", error_str)
     answers = [None] * total
-    completed = threading.Semaphore(0)   # counts finished tasks
     done_count = [0]
     lock = threading.Lock()
 
     def scan_one(idx: int, path: Path):
         try:
-            answer = _vision_call(client, path)
+            if backend == "ollama":
+                answer = _vision_call_ollama(ollama_model, path)
+            else:
+                answer = _vision_call_anthropic(client, path)
             result = ("OK", answer)
         except Exception as exc:
             result = ("ERR", str(exc))
@@ -201,22 +257,21 @@ def _run_scan(data: dict, q: queue.Queue):
         with lock:
             done_count[0] += 1
             cnt = done_count[0]
-        send(progress=round((cnt / total) * 80),   # 0-80% = scanning phase
-             current=f"{cnt}/{total} scanned")
+        send(progress=round((cnt / total) * 80), current=f"{cnt}/{total} scanned")
 
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
-        futures = {pool.submit(scan_one, i, p): i for i, p in enumerate(jpgs)}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(scan_one, i, p): i for i, p in enumerate(files)}
         for _ in as_completed(futures):
-            pass   # progress sent from inside scan_one
+            pass
 
-    # ── Phase 2: assign batches and copy (sequential — order matters) ─────────
+    # ── Phase 2: assign batches and copy ──────────────────────────────────────
     send(tag="info", msg="Scan complete — assigning batches and copying files…")
     current_folder = None
     n_batches = n_copied = n_skipped = n_errors = 0
 
-    for i, path in enumerate(jpgs):
+    for i, path in enumerate(files):
         status, value = answers[i]
-        pct = 80 + round((i / total) * 20)          # 80-100% = copy phase
+        pct = 80 + round((i / total) * 20)
 
         if status == "ERR":
             send(tag="err", msg=f"  ERROR  {path.name}: {value}", progress=pct)
@@ -284,11 +339,11 @@ HTML = r"""<!DOCTYPE html>
   .field:last-child { margin-bottom: 0; }
   .field label { width: 100px; font-size: 13px; color: var(--muted); flex-shrink: 0; }
   .field-row { flex: 1; display: flex; gap: 8px; }
-  input[type=text], input[type=password] {
+  input[type=text], input[type=password], select {
     flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 7px;
     padding: 7px 11px; font-size: 13px; color: var(--text); outline: none; transition: border-color .15s; font-family: inherit;
   }
-  input[type=text]:focus, input[type=password]:focus { border-color: var(--amber); }
+  input[type=text]:focus, input[type=password]:focus, select:focus { border-color: var(--amber); }
   .btn { cursor: pointer; border-radius: 7px; font-size: 13px; font-weight: 500; padding: 7px 14px; border: 1px solid var(--border); background: var(--bg); color: var(--text); transition: background .12s, border-color .12s; white-space: nowrap; font-family: inherit; }
   .btn:hover { background: var(--border); }
   .btn-primary { background: var(--amber); color: #fff; border-color: var(--amber); font-size: 14px; padding: 9px 22px; }
@@ -314,6 +369,13 @@ HTML = r"""<!DOCTYPE html>
   .status-bar { font-size: 12px; color: var(--muted); margin-bottom: 8px; min-height: 18px; }
   .actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
   .hidden { display: none !important; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 500; }
+  .badge-green { background: var(--green-bg); color: var(--green); }
+  .badge-red   { background: var(--red-bg);   color: var(--red); }
+  .badge-muted { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
+  .segment { display: flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+  .segment button { flex: 1; padding: 7px 14px; font-size: 13px; font-weight: 500; border: none; background: var(--bg); color: var(--muted); cursor: pointer; transition: background .12s, color .12s; font-family: inherit; }
+  .segment button.active { background: var(--amber); color: #fff; }
 </style>
 </head>
 <body>
@@ -325,17 +387,52 @@ HTML = r"""<!DOCTYPE html>
 
 <div class="main">
 
-  <!-- Settings -->
+  <!-- Backend + Settings -->
   <div class="card">
-    <div class="card-title">Configuration</div>
+    <div class="card-title">Vision Backend</div>
 
     <div class="field">
-      <label>API key</label>
-      <div class="field-row">
-        <input type="password" id="apiKey" placeholder="sk-ant-…" autocomplete="off">
-        <button class="btn btn-sm" onclick="toggleKey()">Show</button>
+      <label>Backend</label>
+      <div class="segment" id="backendSeg">
+        <button class="active" onclick="setBackend('ollama')">🖥 Local (Ollama)</button>
+        <button onclick="setBackend('anthropic')">☁️ Anthropic Claude</button>
       </div>
     </div>
+
+    <!-- Ollama fields -->
+    <div id="ollamaFields">
+      <div class="field">
+        <label>Model</label>
+        <div class="field-row">
+          <select id="ollamaModel">
+            <option value="llava-phi3">llava-phi3 (recommended, ~2.9 GB)</option>
+            <option value="llava">llava (more capable, ~4.7 GB)</option>
+            <option value="moondream">moondream (fastest, ~1.7 GB)</option>
+            <option value="minicpm-v">minicpm-v (~5.5 GB)</option>
+          </select>
+          <button class="btn btn-sm" onclick="checkOllama()">Check</button>
+        </div>
+      </div>
+      <div class="field">
+        <label></label>
+        <span id="ollamaStatus" class="badge badge-muted">Not checked</span>
+      </div>
+    </div>
+
+    <!-- Anthropic fields -->
+    <div id="anthropicFields" class="hidden">
+      <div class="field">
+        <label>API key</label>
+        <div class="field-row">
+          <input type="password" id="apiKey" placeholder="sk-ant-…" autocomplete="off">
+          <button class="btn btn-sm" onclick="toggleKey()">Show</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Folders</div>
 
     <div class="field">
       <label>Input folder</label>
@@ -386,26 +483,77 @@ HTML = r"""<!DOCTYPE html>
 
 <script>
 let evtSource = null;
+let currentBackend = 'ollama';
 
 // ── load config ───────────────────────────────────────────────────────────────
 fetch('/config').then(r => r.json()).then(cfg => {
-  if (cfg.api_key)    document.getElementById('apiKey').value    = cfg.api_key;
-  if (cfg.input_dir)  document.getElementById('inputDir').value  = cfg.input_dir;
-  if (cfg.output_dir) document.getElementById('outputDir').value = cfg.output_dir;
-  if (cfg.recursive)  document.getElementById('recursive').checked = cfg.recursive;
+  if (cfg.api_key)      document.getElementById('apiKey').value    = cfg.api_key;
+  if (cfg.input_dir)    document.getElementById('inputDir').value  = cfg.input_dir;
+  if (cfg.output_dir)   document.getElementById('outputDir').value = cfg.output_dir;
+  if (cfg.recursive)    document.getElementById('recursive').checked = cfg.recursive;
+  if (cfg.ollama_model) document.getElementById('ollamaModel').value = cfg.ollama_model;
+  if (cfg.backend)      setBackend(cfg.backend, false);
 }).catch(() => {});
+
+// Auto-check Ollama on load
+window.addEventListener('load', () => { if (currentBackend === 'ollama') checkOllama(); });
+
+function setBackend(b, save = true) {
+  currentBackend = b;
+  const btns = document.querySelectorAll('#backendSeg button');
+  btns[0].classList.toggle('active', b === 'ollama');
+  btns[1].classList.toggle('active', b === 'anthropic');
+  document.getElementById('ollamaFields').classList.toggle('hidden', b !== 'ollama');
+  document.getElementById('anthropicFields').classList.toggle('hidden', b !== 'anthropic');
+  if (save) saveConfig();
+}
 
 function saveConfig() {
   const cfg = {
-    api_key:    document.getElementById('apiKey').value.trim(),
-    input_dir:  document.getElementById('inputDir').value.trim(),
-    output_dir: document.getElementById('outputDir').value.trim(),
-    recursive:  document.getElementById('recursive').checked,
+    backend:      currentBackend,
+    api_key:      document.getElementById('apiKey').value.trim(),
+    ollama_model: document.getElementById('ollamaModel').value,
+    input_dir:    document.getElementById('inputDir').value.trim(),
+    output_dir:   document.getElementById('outputDir').value.trim(),
+    recursive:    document.getElementById('recursive').checked,
   };
   fetch('/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg) });
 }
 
-// ── UI helpers ────────────────────────────────────────────────────────────────
+function checkOllama() {
+  const el = document.getElementById('ollamaStatus');
+  el.className = 'badge badge-muted'; el.textContent = 'Checking…';
+  fetch('/check-ollama').then(r => r.json()).then(d => {
+    if (d.running) {
+      const sel = document.getElementById('ollamaModel');
+      const cur = sel.value;
+      if (d.models.length) {
+        // Add any installed models not already in the list
+        d.models.forEach(m => {
+          if (![...sel.options].some(o => o.value === m)) {
+            const opt = document.createElement('option'); opt.value = m; opt.textContent = m;
+            sel.insertBefore(opt, sel.firstChild);
+          }
+        });
+        // Prefer an installed model
+        const installed = d.models.find(m => sel.value === m) || d.models[0];
+        sel.value = installed || cur;
+        el.className = 'badge badge-green';
+        el.textContent = `✓ Ollama running — ${d.models.length} vision model(s) installed`;
+      } else {
+        el.className = 'badge badge-red';
+        el.textContent = '⚠ Ollama running but no vision model found — see setup below';
+      }
+    } else {
+      el.className = 'badge badge-red';
+      el.textContent = '✗ Ollama not running — install from ollama.com';
+    }
+  }).catch(() => {
+    el.className = 'badge badge-red';
+    el.textContent = '✗ Could not reach Ollama';
+  });
+}
+
 function toggleKey() {
   const el = document.getElementById('apiKey');
   el.type = el.type === 'password' ? 'text' : 'password';
@@ -426,15 +574,16 @@ function log(msg, tag) {
   box.scrollTop = box.scrollHeight;
 }
 
-// ── scan ──────────────────────────────────────────────────────────────────────
 function startScan() {
-  const apiKey   = document.getElementById('apiKey').value.trim();
-  const inputDir = document.getElementById('inputDir').value.trim();
-  const outputDir= document.getElementById('outputDir').value.trim();
+  const inputDir  = document.getElementById('inputDir').value.trim();
+  const outputDir = document.getElementById('outputDir').value.trim();
+  const apiKey    = document.getElementById('apiKey').value.trim();
 
-  if (!apiKey)    { alert('Please enter your Anthropic API key.'); return; }
-  if (!inputDir)  { alert('Please select an input folder.');        return; }
-  if (!outputDir) { alert('Please select an output folder.');       return; }
+  if (!inputDir)  { alert('Please select an input folder.');   return; }
+  if (!outputDir) { alert('Please select an output folder.');  return; }
+  if (currentBackend === 'anthropic' && !apiKey) {
+    alert('Please enter your Anthropic API key.'); return;
+  }
 
   saveConfig();
   document.getElementById('logBox').innerHTML = '';
@@ -449,8 +598,12 @@ function startScan() {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({
-      api_key: apiKey, input_dir: inputDir, output_dir: outputDir,
-      recursive: document.getElementById('recursive').checked
+      backend:      currentBackend,
+      api_key:      apiKey,
+      ollama_model: document.getElementById('ollamaModel').value,
+      input_dir:    inputDir,
+      output_dir:   outputDir,
+      recursive:    document.getElementById('recursive').checked
     })
   })
   .then(r => r.json())
@@ -459,14 +612,11 @@ function startScan() {
     evtSource.onmessage = function(e) {
       if (!e.data || e.data === '{}') return;
       const msg = JSON.parse(e.data);
-
       if (msg.msg)      log(msg.msg, msg.tag);
       if (msg.progress !== undefined) document.getElementById('progBar').style.width = msg.progress + '%';
       if (msg.current)  document.getElementById('statusBar').textContent = 'Scanning: ' + msg.current;
-
       if (msg.done) {
-        evtSource.close();
-        evtSource = null;
+        evtSource.close(); evtSource = null;
         document.getElementById('runBtn').disabled = false;
         document.getElementById('cancelBtn').style.display = 'none';
         document.getElementById('statusBar').textContent = 'Done';
