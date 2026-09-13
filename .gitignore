@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# App config (contains API key)
+.film_batch_sorter.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
