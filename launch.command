@@ -1,16 +1,27 @@
 #!/bin/bash
-# ─────────────────────────────────────────────────────────────────────────────
-#  Film Batch Sorter — double-click to launch
-# ─────────────────────────────────────────────────────────────────────────────
 cd "$(dirname "$0")"
 
-# Check for Python 3
-if ! command -v python3 &>/dev/null; then
-  osascript -e 'display alert "Python 3 not found" message "Install Python 3 from https://python.org and try again."'
-  exit 1
+# Create virtual environment if it doesn't exist
+if [ ! -d ".venv" ]; then
+  echo "Setting up virtual environment (first run — takes a minute)…"
+  python3 -m venv .venv
 fi
 
-# Install / upgrade dependencies (silent after first run)
-python3 -m pip install flask anthropic --quiet 2>&1 | grep -v WARNING
+PYTHON=".venv/bin/python"
+PIP=".venv/bin/pip"
 
-python3 film_batch_sorter.py
+# Install / upgrade dependencies
+echo "Checking dependencies…"
+$PIP install --quiet --upgrade flask anthropic pillow rawpy
+
+# Start the server
+echo "Starting Film Batch Sorter…"
+$PYTHON film_batch_sorter.py &
+SERVER_PID=$!
+
+# Wait for server to be ready
+sleep 3
+open http://localhost:5174
+
+echo "Server running (PID $SERVER_PID). Close this window to stop."
+wait $SERVER_PID
